@@ -2,6 +2,14 @@ import React, {
   useState, useEffect, useRef, useCallback,
 } from 'react'
 import { QUESTIONS } from './db.js'
+import {
+  addQuestion,
+  addQuestions,
+  deleteQuestion,
+  getQuestions,
+  normalizeSection,
+  seedQuestions,
+} from './questionStore.js'
 
 // ─── tiny CSS-in-JS helper (no deps) ────────────────────────────────────────
 const S = {
@@ -258,41 +266,128 @@ function useLocalStorage(key, init) {
   return [val, save]
 }
 
-// ─── Main App ─────────────────────────────────────────────────────────────────
-const AI_MODEL = 'claude-sonnet-4-20250514'
+function csvRows(text) {
+  const rows = []
+  let row = []
+  let cell = ''
+  let quoted = false
 
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i]
+    const next = text[i + 1]
+    if (quoted && char === '"' && next === '"') {
+      cell += '"'
+      i += 1
+    } else if (char === '"') {
+      quoted = !quoted
+    } else if (!quoted && char === ',') {
+      row.push(cell)
+      cell = ''
+    } else if (!quoted && (char === '\n' || char === '\r')) {
+      if (char === '\r' && next === '\n') i += 1
+      row.push(cell)
+      if (row.some((v) => v.trim())) rows.push(row)
+      row = []
+      cell = ''
+    } else {
+      cell += char
+    }
+  }
+
+  row.push(cell)
+  if (row.some((v) => v.trim())) rows.push(row)
+  return rows
+}
+
+function parseQuestionFile(name, text) {
+  if (name.toLowerCase().endsWith('.json')) {
+    const data = JSON.parse(text)
+    const list = Array.isArray(data) ? data : data.questions
+    if (!Array.isArray(list)) throw new Error('JSON array yoki { "questions": [] } formatida bo‘lishi kerak.')
+    return list
+  }
+
+  const rows = csvRows(text)
+  if (!rows.length) return []
+  const header = rows[0].map((h) => h.trim().toLowerCase())
+  const sectionIndex = header.indexOf('section')
+  const questionIndex = header.indexOf('question')
+  const answerIndex = header.indexOf('answer')
+  const hasHeader = questionIndex !== -1 && answerIndex !== -1
+
+  return rows.slice(hasHeader ? 1 : 0).map((row) => ({
+    section: hasHeader ? row[sectionIndex] : row[0],
+    question: hasHeader ? row[questionIndex] : row[1],
+    answer: hasHeader ? row[answerIndex] : row[2],
+  }))
+}
+
+// ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
+  const electron = window.mindpingElectron
   const [tab, setTab]           = useState('setup')
   const [delay, setDelay]       = useState({ h: 0, m: 30, s: 0 })
   const [running, setRunning]   = useState(false)
   const [sentCount, setSentCount] = useState(0)
   const [nextAt, setNextAt]     = useState(null)        // timestamp
   const [countdown, setCountdown] = useState('')
-  const [notifPerm, setNotifPerm] = useState(Notification.permission)
+  const [notifPerm, setNotifPerm] = useState(electron ? 'granted' : Notification.permission)
   const [currentQ, setCurrentQ] = useState(null)
   const [userAns, setUserAns]   = useState('')
   const [aiResult, setAiResult] = useState(null)
   const [checking, setChecking] = useState(false)
   const [recording, setRecording] = useState(false)
   const [history, saveHistory]  = useLocalStorage('mp_history', [])
+  const [questions, setQuestions] = useState([])
+  const [questionForm, setQuestionForm] = useState({ section: 'js/general', question: '', answer: '' })
+  const [questionMsg, setQuestionMsg] = useState('')
+  const [scopeMode, setScopeMode] = useLocalStorage('mp_scope_mode', 'all')
+  const [selectedRoot, setSelectedRoot] = useLocalStorage('mp_selected_root', 'all')
+  const [selectedSections, setSelectedSections] = useLocalStorage('mp_selected_sections', [])
 
   const swRef        = useRef(null)   // ServiceWorkerRegistration
   const sessionRef   = useRef(null)   // current session id
   const intervalRef  = useRef(null)   // main scheduling timeout
   const countdownRef = useRef(null)   // 1-second tick
-  const nextIndexRef = useRef(0)
+  const activeDelayRef = useRef(delay)
   const recRef       = useRef(null)
+
+  const refreshQuestions = useCallback(async () => {
+    const seeded = await seedQuestions(QUESTIONS)
+    setQuestions(seeded)
+  }, [])
+
+  useEffect(() => {
+    refreshQuestions().catch((err) => {
+      console.error('[MindPing] question store failed:', err)
+      setQuestions(QUESTIONS.map((q) => ({ ...q, id: `fallback_${q.id}`, section: q.section || 'js/general' })))
+    })
+  }, [refreshQuestions])
+
+  const sections = [...new Set(questions.map((q) => normalizeSection(q.section)))].sort()
+  const roots = [...new Set(sections.map((section) => section.split('/')[0]))].sort()
+  const visibleSections = selectedRoot === 'all'
+    ? sections
+    : sections.filter((section) => section === selectedRoot || section.startsWith(`${selectedRoot}/`))
+  const selectedQuestions = questions.filter((q) => {
+    const section = normalizeSection(q.section)
+    if (scopeMode === 'all') return true
+    if (scopeMode === 'root') return selectedRoot === 'all' || section === selectedRoot || section.startsWith(`${selectedRoot}/`)
+    if (scopeMode === 'sections') return selectedSections.includes(section)
+    return true
+  })
 
   // ── Register SW ─────────────────────────────────────────────
   useEffect(() => {
     if (!('serviceWorker' in navigator)) return
+    if (electron) return
     navigator.serviceWorker.ready.then(reg => { swRef.current = reg })
     const handler = e => {
       if (e.data?.type === 'SHOW_QUESTION') openAnswerView(e.data.data)
     }
     navigator.serviceWorker.addEventListener('message', handler)
     return () => navigator.serviceWorker.removeEventListener('message', handler)
-  }, [])
+  }, [electron])
 
   // ── Countdown tick ─────────────────────────────────────────
   useEffect(() => {
@@ -314,6 +409,11 @@ export default function App() {
 
   // ── Notif permission ────────────────────────────────────────
   const requestNotif = async () => {
+    if (electron) {
+      await electron.showTestNotification()
+      setNotifPerm('granted')
+      return
+    }
     const p = await Notification.requestPermission()
     setNotifPerm(p)
   }
@@ -338,7 +438,33 @@ export default function App() {
     if (s) parts.push(`${s} soniya`)
     return parts.length ? parts.join(' ') : '0 soniya'
   }
-  const canStart = notifPerm === 'granted' && delayMs() > 0 && QUESTIONS.length > 0
+  const canStart = notifPerm === 'granted' && delayMs() > 0 && selectedQuestions.length > 0
+
+  // ── Electron background events ─────────────────────────────
+  useEffect(() => {
+    if (!electron) return
+
+    const offFired = electron.onQuestionFired(() => {
+      setSentCount(c => c + 1)
+      setNextAt(Date.now() + delayMs(activeDelayRef.current))
+    })
+    const offOpen = electron.onOpenQuestion(q => openAnswerView(q))
+    const offStopped = electron.onSessionStopped(() => {
+      sessionRef.current = null
+      clearTimeout(intervalRef.current)
+      clearInterval(countdownRef.current)
+      setRunning(false)
+      setNextAt(null)
+      setCountdown('')
+      setSentCount(0)
+    })
+
+    return () => {
+      offFired()
+      offOpen()
+      offStopped()
+    }
+  }, [electron, delayMs])
 
   // ── SW postMessage helper ───────────────────────────────────
   const swPost = (msg) => {
@@ -346,54 +472,77 @@ export default function App() {
     if (sw) sw.postMessage(msg)
   }
 
+  const showQuestionNotification = useCallback((q) => {
+    const options = {
+      body: q.question,
+      tag: 'mp-' + Date.now(),
+      data: q,
+      requireInteraction: true,
+      actions: [
+        { action: 'answer', title: '✍️ Javob berish' },
+        { action: 'skip', title: "⏭ O'tkazish" },
+      ],
+    }
+
+    if (swRef.current?.showNotification) {
+      swRef.current.showNotification('🧠 MindPing — Savol!', options)
+      return
+    }
+
+    const n = new Notification('🧠 MindPing — Savol!', options)
+    n.onclick = () => { n.close(); openAnswerView(q); window.focus() }
+  }, [])
+
   // ── Schedule one notification ───────────────────────────────
   const scheduleOne = useCallback((sessionId, currentDelay) => {
     const ms = delayMs(currentDelay)
-    const idx = nextIndexRef.current
-    const q   = QUESTIONS[idx % QUESTIONS.length]
-    const nid = Date.now()
+    const q = selectedQuestions[Math.floor(Math.random() * selectedQuestions.length)]
 
-    swPost({ type: 'SCHEDULE', question: q, delayMs: ms, sessionId, notifId: nid })
-
-    // Fallback if SW controller not available
-    if (!navigator.serviceWorker?.controller && !swRef.current?.active) {
-      setTimeout(() => {
-        if (sessionRef.current !== sessionId) return
-        const n = new Notification('🧠 MindPing — Savol!', {
-          body: q.question, requireInteraction: true,
-        })
-        n.onclick = () => { n.close(); openAnswerView(q); window.focus() }
-      }, ms)
-    }
-
-    nextIndexRef.current = (idx + 1) % QUESTIONS.length
     const at = Date.now() + ms
     setNextAt(at)
 
-    // After ms, update counter and schedule the next one
+    // Browser service workers are allowed to sleep, so keep the actual timer
+    // in the open page and use the SW only to display/click the notification.
     intervalRef.current = setTimeout(() => {
       if (sessionRef.current !== sessionId) return
+      showQuestionNotification(q)
       setSentCount(c => c + 1)
       scheduleOne(sessionId, currentDelay)
     }, ms)
-  }, [delayMs])
+  }, [delayMs, selectedQuestions, showQuestionNotification])
 
   // ── Start session ───────────────────────────────────────────
   const startSession = useCallback(() => {
     const sid = 'sess_' + Date.now()
     sessionRef.current  = sid
-    nextIndexRef.current = 0
-    swPost({ type: 'SET_SESSION', sessionId: sid })
+    activeDelayRef.current = delay
+    swPost({ type: 'SET_SESSION', sid })
     setSentCount(0)
     setRunning(true)
+    setNextAt(Date.now() + delayMs(delay))
+
+    if (electron) {
+      electron.startSession({
+        delayMs: delayMs(delay),
+        questions: selectedQuestions,
+      }).catch((err) => {
+        console.error('[MindPing] Electron session failed:', err)
+        sessionRef.current = null
+        setRunning(false)
+        setNextAt(null)
+      })
+      return
+    }
+
     scheduleOne(sid, delay)
-  }, [delay, scheduleOne])
+  }, [delay, delayMs, electron, scheduleOne, selectedQuestions])
 
   // ── Stop session ────────────────────────────────────────────
   const stopSession = () => {
     sessionRef.current = null
     clearTimeout(intervalRef.current)
     clearInterval(countdownRef.current)
+    electron?.stopSession()
     swPost({ type: 'STOP' })
     setRunning(false)
     setNextAt(null)
@@ -448,36 +597,16 @@ export default function App() {
     setChecking(true)
     setAiResult(null)
 
-    const prompt = `Sen o'quv yordamchisiszan. Foydalanuvchi savol uchun javob berdi.
-
-Savol: "${currentQ.question}"
-To'g'ri javob (etalon): "${currentQ.answer}"
-Foydalanuvchi javobi: "${userAns}"
-
-Faqat quyidagi JSON formatida javob ber, hech qanday qo'shimcha matn, izoh yoki markdown yo'q:
-{"score":0,"is_correct":false,"feedback":"","better_answer":"","key_points":[]}
-
-Qoidalar:
-- score: 0-100 (100=mukammal, 0=noto'g'ri)
-- is_correct: score>=70 bo'lsa true
-- feedback: O'zbek tilida 1-2 jumla, konstruktiv
-- better_answer: Ideal to'liq javob o'zbek tilida
-- key_points: O'tkazib yuborilgan muhim nuqtalar (bo'sh massiv bo'lishi mumkin)`
-
     try {
-      const res  = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: AI_MODEL,
-          max_tokens: 1000,
-          messages: [{ role: 'user', content: prompt }],
-        }),
+      if (!electron?.checkAnswer) {
+        throw new Error('AI tekshiruv Electron app ichida ishlaydi.')
+      }
+
+      const r = await electron.checkAnswer({
+        question: currentQ.question,
+        referenceAnswer: currentQ.answer,
+        userAnswer: userAns,
       })
-      const data = await res.json()
-      const text = (data.content?.find(b => b.type === 'text')?.text || '{}')
-        .replace(/```json|```/g, '').trim()
-      const r = JSON.parse(text)
       setAiResult(r)
 
       // save to history
@@ -495,7 +624,7 @@ Qoidalar:
     } catch {
       setAiResult({
         score: 0, is_correct: false,
-        feedback: 'AI bilan bog\'lanishda xato. Internet aloqasini tekshiring.',
+        feedback: 'AI bilan bog\'lanishda xato. OPENAI_API_KEY va internet aloqasini tekshiring.',
         better_answer: currentQ.answer,
         key_points: [],
       })
@@ -509,6 +638,48 @@ Qoidalar:
   const statsAvg     = statsTotal
     ? Math.round(history.reduce((s, h) => s + h.score, 0) / statsTotal)
     : 0
+
+  const addQuestionFromForm = async () => {
+    try {
+      await addQuestion(questionForm)
+      setQuestionForm({ ...questionForm, question: '', answer: '' })
+      setQuestionMsg("Savol qo'shildi.")
+      await refreshQuestions()
+    } catch (err) {
+      setQuestionMsg(err.message || "Savol qo'shishda xato.")
+    }
+  }
+
+  const importQuestionFile = async (event) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+
+    try {
+      const text = await file.text()
+      const parsed = parseQuestionFile(file.name, text)
+      const count = await addQuestions(parsed)
+      setQuestionMsg(`${count} ta savol import qilindi.`)
+      await refreshQuestions()
+    } catch (err) {
+      setQuestionMsg(err.message || 'Importda xato.')
+    }
+  }
+
+  const removeQuestion = async (id) => {
+    if (!window.confirm("Bu savolni o'chirasizmi?")) return
+    await deleteQuestion(id)
+    setQuestionMsg("Savol o'chirildi.")
+    await refreshQuestions()
+  }
+
+  const toggleSection = (section) => {
+    setSelectedSections((prev) => (
+      prev.includes(section)
+        ? prev.filter((item) => item !== section)
+        : [...prev, section]
+    ))
+  }
 
   // ════════════════════════════════════════════════════════════
   //  RENDER
@@ -525,7 +696,7 @@ Qoidalar:
         </div>
         <div style={S.tabs}>
           <Tab label="⚙ sozlash"             active={tab === 'setup'}     onClick={() => setTab('setup')} />
-          <Tab label={`📚 savollar (${QUESTIONS.length})`} active={tab === 'questions'} onClick={() => setTab('questions')} />
+          <Tab label={`📚 savollar (${questions.length})`} active={tab === 'questions'} onClick={() => setTab('questions')} />
           <Tab label="📊 tarix"              active={tab === 'history'}   onClick={() => setTab('history')} />
         </div>
       </nav>
@@ -569,6 +740,63 @@ Qoidalar:
               </div>
             </div>
 
+            {/* Question scope */}
+            <SLabel>Savol manbasi</SLabel>
+            <div style={S.card()}>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
+                <Btn sm variant={scopeMode === 'all' ? 'primary' : 'ghost'} onClick={() => setScopeMode('all')}>
+                  Mix barcha
+                </Btn>
+                <Btn sm variant={scopeMode === 'root' ? 'primary' : 'ghost'} onClick={() => setScopeMode('root')}>
+                  Section mix
+                </Btn>
+                <Btn sm variant={scopeMode === 'sections' ? 'primary' : 'ghost'} onClick={() => setScopeMode('sections')}>
+                  Mavzular
+                </Btn>
+              </div>
+
+              {scopeMode !== 'all' && (
+                <div style={{ marginBottom: 12 }}>
+                  <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--dim)', marginBottom: 8 }}>
+                    Asosiy section:
+                  </div>
+                  <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap' }}>
+                    <Btn sm variant={selectedRoot === 'all' ? 'primary' : 'ghost'} onClick={() => setSelectedRoot('all')}>
+                      all
+                    </Btn>
+                    {roots.map((root) => (
+                      <Btn key={root} sm variant={selectedRoot === root ? 'primary' : 'ghost'} onClick={() => setSelectedRoot(root)}>
+                        {root}
+                      </Btn>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {scopeMode === 'sections' && (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(160px,1fr))', gap: 8 }}>
+                  {visibleSections.map((section) => (
+                    <label key={section} style={{
+                      display: 'flex', alignItems: 'center', gap: 8,
+                      background: 'var(--bg3)', border: '1px solid var(--border)',
+                      borderRadius: 8, padding: '8px 10px', fontSize: 12,
+                    }}>
+                      <input
+                        type="checkbox"
+                        checked={selectedSections.includes(section)}
+                        onChange={() => toggleSection(section)}
+                      />
+                      <span style={{ fontFamily: 'var(--mono)', color: 'var(--dim)' }}>{section}</span>
+                    </label>
+                  ))}
+                </div>
+              )}
+
+              <div style={{ fontSize: 12, color: selectedQuestions.length ? 'var(--dim)' : 'var(--danger)', marginTop: 12 }}>
+                Tanlangan savollar: <strong style={{ color: selectedQuestions.length ? 'var(--ac)' : 'var(--danger)' }}>{selectedQuestions.length}</strong>
+              </div>
+            </div>
+
             {/* Session */}
             <SLabel>Sessiyani boshqarish</SLabel>
             <div style={S.card()}>
@@ -579,8 +807,7 @@ Qoidalar:
                     <span style={{ fontSize: 13 }}>
                       Sessiya boshlaganda, har{' '}
                       <strong style={{ color: 'var(--ac)' }}>{delayLabel()}</strong>
-                      {' '}da <strong style={{ color: 'var(--ac)' }}>{QUESTIONS.length}</strong> ta savol
-                      navbat bilan bildirishnoma orqali yuboriladi.
+                      {' '}da tanlangan bazadan 1 ta random savol bildirishnoma orqali yuboriladi.
                     </span>
                   </InfoBox>
                   <div style={{ marginTop: 14, display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -589,7 +816,7 @@ Qoidalar:
                     </Btn>
                     {!canStart && (
                       <span style={{ fontSize: 12, color: 'var(--danger)' }}>
-                        {notifPerm !== 'granted' ? 'Ruxsat berilmagan' : delayMs() === 0 ? 'Delay 0' : ''}
+                        {notifPerm !== 'granted' ? 'Ruxsat berilmagan' : delayMs() === 0 ? 'Delay 0' : 'Tanlangan savol yo‘q'}
                       </span>
                     )}
                   </div>
@@ -615,15 +842,72 @@ Qoidalar:
         {/* ══════════ QUESTIONS TAB ══════════ */}
         {tab === 'questions' && (
           <div style={{ animation: 'fadeIn .35s ease both' }}>
-            <SLabel>Savollar ro'yxati ({QUESTIONS.length} ta)</SLabel>
+            <SLabel>Yangi savol</SLabel>
+            <div style={S.card()}>
+              <label style={{ fontSize: 11, color: 'var(--dim)', fontFamily: 'var(--mono)', display: 'block', marginBottom: 6 }}>
+                Section
+              </label>
+              <Inp
+                value={questionForm.section}
+                onChange={(e) => setQuestionForm((prev) => ({ ...prev, section: e.target.value }))}
+                placeholder="js/engine yoki react/fiber"
+                style={{ marginBottom: 10 }}
+              />
+
+              <label style={{ fontSize: 11, color: 'var(--dim)', fontFamily: 'var(--mono)', display: 'block', marginBottom: 6 }}>
+                Savol
+              </label>
+              <Textarea
+                value={questionForm.question}
+                onChange={(e) => setQuestionForm((prev) => ({ ...prev, question: e.target.value }))}
+                placeholder="Savol matni..."
+                rows={2}
+                style={{ marginBottom: 10 }}
+              />
+
+              <label style={{ fontSize: 11, color: 'var(--dim)', fontFamily: 'var(--mono)', display: 'block', marginBottom: 6 }}>
+                Etalon javob
+              </label>
+              <Textarea
+                value={questionForm.answer}
+                onChange={(e) => setQuestionForm((prev) => ({ ...prev, answer: e.target.value }))}
+                placeholder="AI solishtiradigan to'liq javob..."
+                rows={4}
+              />
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 12, flexWrap: 'wrap' }}>
+                <Btn
+                  variant="primary"
+                  onClick={addQuestionFromForm}
+                  disabled={!questionForm.question.trim() || !questionForm.answer.trim()}
+                >
+                  + Savol qo'shish
+                </Btn>
+                <label style={{
+                  ...BTN_STYLES.ghost,
+                  display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                  gap: 6, padding: '9px 18px', borderRadius: 8, fontFamily: 'var(--mono)',
+                  fontSize: 12, fontWeight: 700, cursor: 'pointer',
+                }}>
+                  Fayl import
+                  <input type="file" accept=".json,.csv,text/csv,application/json" onChange={importQuestionFile} style={{ display: 'none' }} />
+                </label>
+                {questionMsg && <span style={{ fontSize: 12, color: 'var(--dim)' }}>{questionMsg}</span>}
+              </div>
+            </div>
+
+            <SLabel>Import formati</SLabel>
             <InfoBox>
-              <span>📝</span>
+              <span>i</span>
               <span style={{ fontSize: 12 }}>
-                Savollarni <code style={{ fontFamily: 'var(--mono)', color: 'var(--ac)', background: 'rgba(124,106,247,.1)', padding: '1px 5px', borderRadius: 4 }}>src/db.js</code> faylida tahrirlang.
+                JSON: <code style={{ fontFamily: 'var(--mono)', color: 'var(--ac)' }}>[{"{ section, question, answer }"}]</code>
+                {' '}yoki CSV header: <code style={{ fontFamily: 'var(--mono)', color: 'var(--ac)' }}>section,question,answer</code>
               </span>
             </InfoBox>
+
+            <SLabel>Savollar ro'yxati ({questions.length} ta)</SLabel>
             <div style={{ marginTop: 14 }}>
-              {QUESTIONS.map((q, i) => (
+              {questions.map((q, i) => (
                 <div key={q.id} style={{
                   display: 'flex', alignItems: 'flex-start', gap: 11,
                   padding: 14, background: 'var(--bg3)', border: '1px solid var(--border)',
@@ -640,11 +924,13 @@ Qoidalar:
                     flexShrink: 0, marginTop: 2,
                   }}>#{i + 1}</span>
                   <div style={{ flex: 1 }}>
-                    <div style={{ fontSize: 13, marginBottom: 5 }}>{q.question}</div>
+                    <Badge>{q.section || 'general'}</Badge>
+                    <div style={{ fontSize: 13, marginTop: 8, marginBottom: 5 }}>{q.question}</div>
                     <div style={{ fontSize: 12, color: 'var(--ok)', fontFamily: 'var(--mono)' }}>
                       ✓ {q.answer.slice(0, 120)}{q.answer.length > 120 ? '…' : ''}
                     </div>
                   </div>
+                  <Btn variant="danger" sm onClick={() => removeQuestion(q.id)}>O'chirish</Btn>
                 </div>
               ))}
             </div>

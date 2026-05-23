@@ -1,13 +1,29 @@
 # 🧠 MindPing — Aqlli Takrorlash
 
-Bildirishnomalar orqali savol-javob bilan bilimlarni mustahkamlash uchun React + TypeScript PWA.
+Bildirishnomalar orqali savol-javob bilan bilimlarni mustahkamlash uchun React + Electron macOS app.
 
 ## O'rnatish va ishga tushirish
 
 ```bash
 npm install
-npm run dev        # localhost:3000
-npm run build      # deploy uchun
+npm run electron:dev  # Vite + Electron dev
+npm run electron      # production buildni Electron ichida ochish
+npm run dist:mac      # macOS .app/.dmg build
+```
+
+AI tekshiruv uchun OpenAI API key kerak:
+
+```bash
+export OPENAI_API_KEY="sk-..."
+export OPENAI_MODEL="gpt-5.2" # ixtiyoriy
+npm run electron
+```
+
+`.app`ni Finder’dan ochsangiz, keyni `~/.mindping.env` fayliga yozing:
+
+```bash
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-5.2
 ```
 
 ## Loyiha tuzilmasi
@@ -61,14 +77,25 @@ src/
 
 ## Savol qo'shish
 
-`src/constants/questions.ts` faylida `QUESTIONS` massivini davom ettiring:
+App ichida **Savollar** tabidan qo'shing yoki JSON/CSV import qiling. Savollar IndexedDB'da lokal saqlanadi.
 
-```ts
-{
-  id: 11,           // unikal raqam
-  question: "Savolingiz?",
-  answer: "To'liq javob matni",
-},
+JSON formati:
+
+```json
+[
+  {
+    "section": "js/engine",
+    "question": "Event Loop nima?",
+    "answer": "Event Loop call stack bo'shaganda task va microtasklarni bajaradi..."
+  }
+]
+```
+
+CSV formati:
+
+```csv
+section,question,answer
+react/fiber,Fiber nima?,React Fiber rendering ishini bo'laklarga ajratadigan arxitektura...
 ```
 
 ## Xususiyatlar
@@ -77,10 +104,12 @@ src/
 - 🔔 Mac/brauzer bildirishnomalari (Service Worker)
 - 🎤 Ovozli javob (Web Speech API)
 - ✍️ Text ko'rinishida javob
-- 🧠 Claude AI orqali tekshiruv + ideal javob + nuqtalar
+- 🧠 OpenAI orqali tekshiruv + foiz + ideal javob + yetishmagan nuqtalar
+- 🗂 IndexedDB savollar bazasi, section/topic bo'yicha filter
+- 📥 JSON/CSV import va forma orqali savol qo'shish
 - 📊 Tarix va statistika (localStorage)
-- 🔄 Session ID tizimi (stop bosilsa eski notiflar bekor)
+- 🔄 Random savollar: belgilangan intervalda faqat 1 ta savol yuboriladi
 
 ## Mac bildirishnomalari
 
-System Settings → Notifications → [Brauzer] → Allow
+System Settings → Notifications → MindPing → Allow
