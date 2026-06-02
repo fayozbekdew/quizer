@@ -337,6 +337,7 @@ export default function App() {
   const [aiResult, setAiResult] = useState(null)
   const [checking, setChecking] = useState(false)
   const [recording, setRecording] = useState(false)
+  const [voiceMsg, setVoiceMsg] = useState('')
   const [history, saveHistory]  = useLocalStorage('mp_history', [])
   const [questions, setQuestions] = useState([])
   const [questionForm, setQuestionForm] = useState({ section: 'js/general', question: '', answer: '' })
@@ -360,7 +361,7 @@ export default function App() {
   useEffect(() => {
     refreshQuestions().catch((err) => {
       console.error('[MindPing] question store failed:', err)
-      setQuestions(QUESTIONS.map((q) => ({ ...q, id: `fallback_${q.id}`, section: q.section || 'js/general' })))
+      setQuestions(QUESTIONS.map((q) => ({ ...q, id: `fallback_${q.id}`, section: q.section || q.topic || 'js/general' })))
     })
   }, [refreshQuestions])
 
@@ -566,8 +567,64 @@ export default function App() {
   }
 
   // ── Voice input ─────────────────────────────────────────────
+  const startElectronRecording = async () => {
+    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+      alert("Mikrofon yozib olish bu qurilmada qo'llab-quvvatlanmadi.")
+      return
+    }
+
+    try {
+      setVoiceMsg('')
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : 'audio/webm'
+      const recorder = new MediaRecorder(stream, { mimeType })
+      const chunks = []
+
+      recorder.ondataavailable = (event) => {
+        if (event.data?.size) chunks.push(event.data)
+      }
+
+      recorder.onstop = async () => {
+        stream.getTracks().forEach((track) => track.stop())
+        recRef.current = null
+        setRecording(false)
+        setVoiceMsg('Ovoz matnga aylantirilmoqda...')
+
+        try {
+          const blob = new Blob(chunks, { type: mimeType })
+          const audioBuffer = await blob.arrayBuffer()
+          const result = await electron.transcribeAudio({ audioBuffer, mimeType })
+          if (result.text) {
+            setUserAns((prev) => (prev + ' ' + result.text).trim())
+            setVoiceMsg('')
+          } else {
+            setVoiceMsg('Ovozdan matn aniqlanmadi.')
+          }
+        } catch (err) {
+          console.error('[MindPing] transcription failed:', err)
+          setVoiceMsg('Ovozni matnga aylantirishda xato. OPENAI_API_KEY va internetni tekshiring.')
+        }
+      }
+
+      recRef.current = { recorder, stream }
+      recorder.start()
+      setRecording(true)
+    } catch (err) {
+      console.error('[MindPing] microphone failed:', err)
+      setVoiceMsg('Mikrofonga ruxsat berilmadi yoki qurilma topilmadi.')
+      setRecording(false)
+    }
+  }
+
   const toggleVoice = () => {
     if (recording) { stopRecording(); return }
+    if (electron?.transcribeAudio) {
+      startElectronRecording()
+      return
+    }
+
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition
     if (!SR) { alert('Brauzeringiz ovozli kiritishni qo\'llab-quvvatlamaydi'); return }
     const rec = new SR()
@@ -586,7 +643,13 @@ export default function App() {
     setRecording(true)
   }
   const stopRecording = () => {
-    try { recRef.current?.stop() } catch {}
+    try {
+      if (recRef.current?.recorder) {
+        if (recRef.current.recorder.state !== 'inactive') recRef.current.recorder.stop()
+        return
+      }
+      recRef.current?.stop()
+    } catch {}
     recRef.current = null
     setRecording(false)
   }
@@ -1037,10 +1100,10 @@ export default function App() {
                 </button>
               </div>
 
-              {recording && (
+              {(recording || voiceMsg) && (
                 <div style={{ fontSize: 12, color: 'var(--danger)', fontFamily: 'var(--mono)', marginBottom: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <span style={{ animation: 'blink 1s infinite', display: 'inline-block' }}>●</span>
-                  Gapiring... (qayta bosing = to'xtatish)
+                  {recording && <span style={{ animation: 'blink 1s infinite', display: 'inline-block' }}>●</span>}
+                  {recording ? "Gapiring... (qayta bosing = to'xtatish)" : voiceMsg}
                 </div>
               )}
 

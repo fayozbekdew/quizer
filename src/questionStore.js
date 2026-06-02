@@ -61,19 +61,26 @@ export async function getQuestions() {
 
 export async function seedQuestions(defaultQuestions) {
   const existing = await getQuestions()
-  if (existing.length) return existing
-
   const db = await openDB()
   const tx = db.transaction(STORE, 'readwrite')
   const store = tx.objectStore(STORE)
+
+  const seedIds = new Set()
   defaultQuestions.forEach((q, index) => {
+    const id = `seed_${q.id || index + 1}`
+    seedIds.add(id)
     store.put(normalizeQuestion({
       ...q,
-      id: `seed_${q.id || index + 1}`,
-      section: q.section || 'js/general',
+      id,
+      section: q.section || q.topic || q.category || 'js/general',
       createdAt: new Date(0).toISOString(),
     }))
   })
+
+  existing
+    .filter((q) => String(q.id).startsWith('seed_') && !seedIds.has(q.id))
+    .forEach((q) => store.delete(q.id))
+
   await txDone(tx)
   return getQuestions()
 }

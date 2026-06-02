@@ -94,6 +94,10 @@ function createWindow() {
     },
   })
 
+  mainWindow.webContents.session.setPermissionRequestHandler((_webContents, permission, callback) => {
+    callback(permission === 'media' || permission === 'microphone')
+  })
+
   mainWindow.on('close', (event) => {
     if (isQuitting) return
     event.preventDefault()
@@ -278,6 +282,43 @@ ipcMain.handle('mindping:check-answer', async (_event, payload) => {
 
   const data = await response.json()
   return { ...JSON.parse(extractOutputText(data)), source: 'openai' }
+})
+
+ipcMain.handle('mindping:transcribe-audio', async (_event, payload) => {
+  const apiKey = process.env.OPENAI_API_KEY
+  if (!apiKey) {
+    throw new Error('OPENAI_API_KEY topilmadi.')
+  }
+
+  const bytes = payload?.audioBuffer
+  if (!bytes) throw new Error('Audio maʼlumot kelmadi.')
+
+  const mimeType = String(payload?.mimeType || 'audio/webm')
+  const extension = mimeType.includes('mp4') ? 'mp4'
+    : mimeType.includes('mpeg') ? 'mpeg'
+    : mimeType.includes('wav') ? 'wav'
+    : mimeType.includes('m4a') ? 'm4a'
+    : 'webm'
+  const buffer = Buffer.from(bytes)
+  const form = new FormData()
+  form.append('model', process.env.OPENAI_TRANSCRIBE_MODEL || 'gpt-4o-mini-transcribe')
+  form.append('language', 'uz')
+  form.append('response_format', 'json')
+  form.append('file', new Blob([buffer], { type: mimeType }), `answer.${extension}`)
+
+  const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiKey}` },
+    body: form,
+  })
+
+  if (!response.ok) {
+    const detail = await response.text()
+    throw new Error(`OpenAI transcription failed: ${response.status} ${detail}`)
+  }
+
+  const data = await response.json()
+  return { text: String(data.text || '').trim() }
 })
 
 app.whenReady().then(() => {

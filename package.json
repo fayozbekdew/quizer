@@ -20,7 +20,10 @@
       "package.json"
     ],
     "mac": {
-      "category": "public.app-category.education"
+      "category": "public.app-category.education",
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "MindPing ovozli javobni matnga aylantirish uchun mikrofoningizdan foydalanadi."
+      }
     },
     "directories": {
       "output": "release"

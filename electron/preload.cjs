@@ -10,6 +10,7 @@ contextBridge.exposeInMainWorld('mindpingElectron', {
   startSession: (payload) => ipcRenderer.invoke('mindping:start-session', payload),
   stopSession: () => ipcRenderer.invoke('mindping:stop-session'),
   checkAnswer: (payload) => ipcRenderer.invoke('mindping:check-answer', payload),
+  transcribeAudio: (payload) => ipcRenderer.invoke('mindping:transcribe-audio', payload),
   showTestNotification: () => ipcRenderer.invoke('mindping:show-test-notification'),
   onQuestionFired: (callback) => on('mindping:question-fired', callback),
   onOpenQuestion: (callback) => on('mindping:open-question', callback),
